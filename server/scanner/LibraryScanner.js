@@ -658,15 +658,38 @@ function isSingleMediaFile(fileUpdateGroup, itemDir) {
   return itemDir === fileUpdateGroup[itemDir]
 }
 
+/**
+ * Guard against inode-reuse coincidences being mistaken for folder moves. Returns the
+ * matched library item if its original path is missing on disk (legitimate move), or
+ * null if the path is still present (the inode match is a coincidence — see issue 5010).
+ *
+ * Uses lstat so we don't follow symlinks. Conservative on non-ENOENT errors (permission,
+ * transient I/O, etc.) — keeps the candidate in that case to avoid silently dropping
+ * real moves when stat fails for unrelated reasons. matchDescription is included in the
+ * rejection log for traceability against the original detection mechanism.
+ */
+async function rejectInodeMatchIfOriginalPathExists(candidate, matchDescription) {
+  if (!candidate) return null
+  try {
+    await fs.lstat(candidate.path)
+  } catch (err) {
+    if (err.code === 'ENOENT') return candidate
+    Logger.warn(`[LibraryScanner] Error checking "${candidate.path}" while validating inode match (treating as still present): ${err.message}`)
+  }
+  Logger.debug(`[LibraryScanner] ${matchDescription} matched library item at "${candidate.path}" but original path still exists — treating as inode-reuse coincidence, not a move`)
+  return null
+}
+
 async function findLibraryItemByItemToItemInoMatch(libraryId, fullPath) {
   const ino = await fileUtils.getIno(fullPath)
   if (!ino) return null
-  const existingLibraryItem = await Database.libraryItemModel.findOneExpanded({
+  const candidate = await Database.libraryItemModel.findOneExpanded({
     libraryId: libraryId,
     ino: ino
   })
-  if (existingLibraryItem) Logger.debug(`[LibraryScanner] Found library item with matching inode "${ino}" at path "${existingLibraryItem.path}"`)
-  return existingLibraryItem
+  const verified = await rejectInodeMatchIfOriginalPathExists(candidate, `Inode "${ino}"`)
+  if (verified) Logger.debug(`[LibraryScanner] Found library item with matching inode "${ino}" at path "${verified.path}"`)
+  return verified
 }
 
 async function findLibraryItemByItemToFileInoMatch(libraryId, fullPath, isSingleMedia) {
@@ -674,7 +697,7 @@ async function findLibraryItemByItemToFileInoMatch(libraryId, fullPath, isSingle
   // check if it was moved from another folder by comparing the ino to the library files
   const ino = await fileUtils.getIno(fullPath)
   if (!ino) return null
-  const existingLibraryItem = await Database.libraryItemModel.findOneExpanded(
+  const candidate = await Database.libraryItemModel.findOneExpanded(
     [
       {
         libraryId: libraryId
@@ -687,8 +710,9 @@ async function findLibraryItemByItemToFileInoMatch(libraryId, fullPath, isSingle
       inode: ino
     }
   )
-  if (existingLibraryItem) Logger.debug(`[LibraryScanner] Found library item with a library file matching inode "${ino}" at path "${existingLibraryItem.path}"`)
-  return existingLibraryItem
+  const verified = await rejectInodeMatchIfOriginalPathExists(candidate, `Library file inode "${ino}"`)
+  if (verified) Logger.debug(`[LibraryScanner] Found library item with a library file matching inode "${ino}" at path "${verified.path}"`)
+  return verified
 }
 
 async function findLibraryItemByFileToItemInoMatch(libraryId, fullPath, isSingleMedia, itemFiles) {
@@ -700,12 +724,13 @@ async function findLibraryItemByFileToItemInoMatch(libraryId, fullPath, isSingle
     if (ino) itemFileInos.push(ino)
   }
   if (!itemFileInos.length) return null
-  const existingLibraryItem = await Database.libraryItemModel.findOneExpanded({
+  const candidate = await Database.libraryItemModel.findOneExpanded({
     libraryId: libraryId,
     ino: {
       [sequelize.Op.in]: itemFileInos
     }
   })
-  if (existingLibraryItem) Logger.debug(`[LibraryScanner] Found library item with inode matching one of "${itemFileInos.join(',')}" at path "${existingLibraryItem.path}"`)
-  return existingLibraryItem
+  const verified = await rejectInodeMatchIfOriginalPathExists(candidate, `Inode match (one of "${itemFileInos.join(',')}")`)
+  if (verified) Logger.debug(`[LibraryScanner] Found library item with inode matching one of "${itemFileInos.join(',')}" at path "${verified.path}"`)
+  return verified
 }
